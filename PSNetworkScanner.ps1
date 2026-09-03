@@ -170,77 +170,173 @@ function Start-Scan($ips){
 
     $script:AllResults=@()
 
-    $ips | ForEach-Object -Parallel {
+    $scanScript = {
+        param($scanIPs,$vendors,$portsList,$vmw,$hyp)
 
-        $ip=$_
+        foreach($ip in $scanIPs){
 
-        $vendors = $using:VendorDB
-        $portsList = $using:CommonPorts
-        $vmw=$using:VMWarePrefixes
-        $hyp=$using:HyperVPrefixes
+            $alive = Test-Connection -Quiet -Count 1 $ip -ErrorAction SilentlyContinue
 
-        $alive = Test-Connection -Quiet -Count 1 $ip -ErrorAction SilentlyContinue
+            $mac="";$vendor="";$hostname="";$ports="";$icon="[?]";$type="Unknown";$prefix=""
 
-        $mac="";$vendor="";$hostname="";$ports="";$icon="❓";$type="Unknown";$prefix=""
+            if($alive){
 
-        if($alive){
+                try{$hostname=[System.Net.Dns]::GetHostEntry($ip).HostName}catch{}
 
-            try{$hostname=[System.Net.Dns]::GetHostEntry($ip).HostName}catch{}
+                Test-Connection $ip | Out-Null
+                $n=Get-NetNeighbor -IPAddress $ip -ErrorAction SilentlyContinue
+                if($n){$mac=$n.LinkLayerAddress}
 
-            Test-Connection $ip | Out-Null
-            $n=Get-NetNeighbor -IPAddress $ip -ErrorAction SilentlyContinue
-            if($n){$mac=$n.LinkLayerAddress}
+                if($mac){
+                    $normalized = ($mac -replace "-",":").ToUpper()
+                    $prefix = ($normalized -split ":")[0..2] -join ":"
 
-            if($mac){
-                $normalized = ($mac -replace "-",":").ToUpper()
-                $prefix = ($normalized -split ":")[0..2] -join ":"
-
-                if($vendors.ContainsKey($prefix)){
-                    $vendor = $vendors[$prefix]
-                }
-            }
-
-            foreach($p in $portsList){
-                try{
-                    $tcp=New-Object Net.Sockets.TcpClient
-                    if($tcp.ConnectAsync($ip,$p).Wait(80)){
-                        if($tcp.Connected){$ports+="$p,"}
+                    if($vendors.ContainsKey($prefix)){
+                        $vendor = $vendors[$prefix]
                     }
-                    $tcp.Close()
-                }catch{}
+                }
+
+                foreach($p in $portsList){
+                    try{
+                        $tcp=New-Object Net.Sockets.TcpClient
+                        if($tcp.ConnectAsync($ip,$p).Wait(80)){
+                            if($tcp.Connected){$ports+="$p,"}
+                        }
+                        $tcp.Close()
+                    }catch{}
+                }
+
+                if($ports){$ports=$ports.TrimEnd(",")}
+
+                if($vmw -contains $prefix){$type="VM";$icon="[VM]"}
+                elseif($hyp -contains $prefix){$type="VM";$icon="[VM]"}
+                elseif($vendor -match "Apple|Samsung"){$type="Phone";$icon="[PH]"}
+                elseif($ports -match "3389"){$type="Windows";$icon="[PC]"}
+                elseif($ports -match "22"){$type="Linux";$icon="[LX]"}
             }
 
-            if($ports){$ports=$ports.TrimEnd(",")}
-
-            if($vmw -contains $prefix){$type="VM";$icon="🖥️"}
-            elseif($hyp -contains $prefix){$type="VM";$icon="🖥️"}
-            elseif($vendor -match "Apple|Samsung"){$type="Phone";$icon="📱"}
-            elseif($ports -match "3389"){$type="Windows";$icon="💻"}
-            elseif($ports -match "22"){$type="Linux";$icon="🐧"}
+            [pscustomobject]@{
+                Icon=$icon;IP=$ip;Host=$hostname;MAC=$mac
+                Vendor=$vendor;Ports=$ports;Type=$type
+                Status=if($alive){"Up"}else{"Down"}
+            }
         }
-
-        [pscustomobject]@{
-            Icon=$icon;IP=$ip;Host=$hostname;MAC=$mac
-            Vendor=$vendor;Ports=$ports;Type=$type
-            Status=if($alive){"Up"}else{"Down"}
-        }
-
-    } -ThrottleLimit 50 | ForEach-Object {
-
-        $script:AllResults += $_
-        Apply-Filter
     }
+
+    $script:ScanPool = [RunspaceFactory]::CreateRunspacePool(1,50)
+    $script:ScanPool.Open()
+    $script:ScanWorkItems = New-Object System.Collections.Generic.List[object]
+    $script:ScanErrors = New-Object System.Collections.Generic.List[string]
+    $script:ScanCompleted = 0
+    $script:ScanTotal = @($ips).Count
+
+    foreach($ip in $ips){
+        $worker = [PowerShell]::Create()
+        $worker.RunspacePool = $script:ScanPool
+        [void]$worker.AddScript($scanScript)
+        [void]$worker.AddArgument(@($ip))
+        [void]$worker.AddArgument($VendorDB)
+        [void]$worker.AddArgument($CommonPorts)
+        [void]$worker.AddArgument($VMWarePrefixes)
+        [void]$worker.AddArgument($HyperVPrefixes)
+
+        $workItem = [pscustomobject]@{
+            PowerShell = $worker
+            AsyncResult = $worker.BeginInvoke()
+        }
+        [void]$script:ScanWorkItems.Add($workItem)
+    }
+
+    $ScanButton.IsEnabled = $false
+    $ProgressBar.IsIndeterminate = $false
+    $ProgressBar.Minimum = 0
+    $ProgressBar.Maximum = $script:ScanTotal
+    $ProgressBar.Value = 0
+    $script:ScanTimer.Start()
 }
 
+$script:ScanTimer = New-Object System.Windows.Threading.DispatcherTimer
+$script:ScanTimer.Interval = [TimeSpan]::FromMilliseconds(100)
+$script:ScanTimer.Add_Tick({
+    if(-not $script:ScanWorkItems){
+        return
+    }
+
+    $completedItems = @($script:ScanWorkItems | Where-Object { $_.AsyncResult.IsCompleted })
+    foreach($item in $completedItems){
+        try{
+            $scanOutput = $item.PowerShell.EndInvoke($item.AsyncResult)
+            foreach($result in $scanOutput){
+                $script:AllResults += $result
+            }
+
+            if($item.PowerShell.Streams.Error.Count -gt 0){
+                foreach($errorRecord in $item.PowerShell.Streams.Error){
+                    [void]$script:ScanErrors.Add($errorRecord.ToString())
+                }
+            }
+        }catch{
+            [void]$script:ScanErrors.Add($_.Exception.Message)
+        }finally{
+            $item.PowerShell.Dispose()
+            [void]$script:ScanWorkItems.Remove($item)
+            $script:ScanCompleted++
+            $ProgressBar.Value = $script:ScanCompleted
+            Apply-Filter
+        }
+    }
+
+    if($script:ScanWorkItems.Count -eq 0){
+        $script:ScanTimer.Stop()
+        $script:ScanPool.Close()
+        $script:ScanPool.Dispose()
+        $script:ScanPool = $null
+        if($script:ScanErrors.Count -gt 0){
+            $message = ($script:ScanErrors | Select-Object -First 3) -join "`n"
+            [System.Windows.MessageBox]::Show("Some scan tasks reported errors:`n$message","Scan Warning")
+        }
+        $ScanButton.IsEnabled = $true
+    }
+})
+
 # ---------------- EVENTS ----------------
-$AutoButton.Add_Click({
+function Set-AutoRange{
     $base = (Get-NetIPAddress -AddressFamily IPv4 | Where {$_.IPAddress -notlike "169.*"} | Select -First 1).IPAddress -split '\.'
+    if($base.Count -ne 4){
+        throw "No usable IPv4 address was found."
+    }
+
     $StartIPBox.Text="$($base[0]).$($base[1]).$($base[2]).1"
     $EndIPBox.Text="$($base[0]).$($base[1]).$($base[2]).254"
+}
+
+$AutoButton.Add_Click({
+    try{ Set-AutoRange }
+    catch{ [System.Windows.MessageBox]::Show($_.Exception.Message,"Network Error") }
 })
 
 $ScanButton.Add_Click({
-    Start-Scan (Get-Range $StartIPBox.Text $EndIPBox.Text)
+    try{
+        if([string]::IsNullOrWhiteSpace($StartIPBox.Text) -or [string]::IsNullOrWhiteSpace($EndIPBox.Text)){
+            Set-AutoRange
+        }
+
+        $startAddress = $null
+        $endAddress = $null
+        if(-not [System.Net.IPAddress]::TryParse($StartIPBox.Text,[ref]$startAddress) -or
+           -not [System.Net.IPAddress]::TryParse($EndIPBox.Text,[ref]$endAddress)){
+            throw "Enter valid start and end IPv4 addresses."
+        }
+
+        $scanIPs = @(Get-Range $StartIPBox.Text $EndIPBox.Text)
+        if($scanIPs.Count -eq 0){
+            throw "The scan range is empty or the end address precedes the start address."
+        }
+
+        Start-Scan $scanIPs
+    }catch{
+        [System.Windows.MessageBox]::Show($_.Exception.Message,"Scan Error")
+    }
 })
 
 $FilterUpOnly.Add_Click({Apply-Filter})
